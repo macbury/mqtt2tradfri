@@ -67,7 +67,13 @@ class LightGateway(MqttController):
 
   def refresh_lights(self):
     devices = self.api(self.devices_commands)
-    self.lights = [dev for dev in devices if dev.has_light_control]
+    self.lights = []
+    for dev in devices:
+      if dev.has_light_control:
+        logger.info("Found light: {}".format(dev.name))
+        self.lights.append(dev)
+      else:
+        logger.info("Found device: {}".format(dev.name))
 
   def find_light(self, name):
     for light in self.lights:
@@ -94,7 +100,7 @@ class LightGateway(MqttController):
       return
 
     lc = light.light_control
-    
+
     if payload[PAYLOAD_STATE] == STATE_ON:
       keys = {}
       if PAYLOAD_TRANSITION in payload:
