@@ -1,0 +1,9 @@
+host: ''
+psk: ''
+identity: ''
+
+mqtt:
+  host: ''
+  port: 7883
+  username: ''
+  password: ''

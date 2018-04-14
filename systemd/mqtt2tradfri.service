@@ -1,0 +1,17 @@
+[Unit]
+Description=Control ikea tradfri lights over mqtt
+After=network.target ntpdate.service
+
+[Service]
+Environment=VIRTUAL_ENV=/home/pi/AIY-voice-kit-python/env
+Environment=PATH=/home/pi/AIY-voice-kit-python/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+ExecStart=/home/pi/AIY-voice-kit-python/env/bin/python3 -u main.py
+WorkingDirectory=/home/pi/mqtt2tradfri/
+StandardOutput=inherit
+StandardError=inherit
+Restart=always
+User=pi
+
+[Install]
+WantedBy=multi-user.target
+
