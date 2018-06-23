@@ -2,6 +2,9 @@ import threading
 from pytradfri import Gateway, color
 from pytradfri.api.libcoap_api import APIFactory
 from pytradfri.error import PytradfriError, RequestTimeout
+from pytradfri.command import Command
+from pytradfri.device import Device
+from pytradfri.const import ROOT_DEVICES
 from slugify import slugify
 from src.mqtt_controller import MqttController
 
@@ -11,7 +14,7 @@ import logging
 
 logger = logging.getLogger('LightGateway')
 
-REFRESH_EVERY = 60
+REFRESH_EVERY = 5 * 60
 
 PAYLOAD_STATE = 'state'
 PAYLOAD_BRIGHTNESS = 'brightness'
@@ -42,12 +45,122 @@ def json_light_state(light):
 
   return json.dumps(payload)
 
+class MyLight:
+  def __init__(self, api, device, client):
+    logger.info("Found light: {}".format(device.name))
+    self.device = device
+    self.api = api
+    self.observeThread = None
+    self.dirty = True
+    self.client = client
+    self.payloads = []
+    self.change(device)
+
+  def push(self):
+    topic = state_light_topic(self.device.name)
+    payload = json_light_state(self.device)
+    logger.info("Publishing to {} with payload {}".format(topic, payload))
+    self.client.publish(topic, payload, 1)
+
+  def change(self, device):
+    logger.info("Changing light: {}".format(device.name))
+    light_topic = set_light_topic(device.name)
+    logger.info('Subscribing to {}'.format(light_topic))
+    self.client.unsubscribe(light_topic)
+    self.client.subscribe(light_topic)
+    self.device = device
+    self.observe()
+    self.push()
+    self.dirty = True
+
+  def on_update(self, updated_device):
+    self.device = updated_device
+    logger.info("Device state updated: {}".format(self.device.name))
+    self.dirty = True
+
+  def update(self):
+    self.dirty = False
+    if self.observeThread is None:
+      self.observe()
+    self.transfer()
+    if self.dirty:
+      logger.info("{} is dirty".format(self.device.name))
+      self.fetch()
+      self.push()
+
+  def observe(self):
+    logger.info("Registering observe for light: {}".format(self.device.name))
+    self.observeThread = threading.Thread(target=self.worker, daemon=True)
+    self.observeThread.start()
+    self.dirty = True
+
+  def worker(self):
+    def err_callback(err):
+      logger.error("On observe callback error")
+      logger.error(err, exc_info=True)
+      self.observeThread = None
+    try:
+      logger.info("Started Worker observe for light: {}".format(self.device.name))
+      self.api(self.device.observe(self.on_update, err_callback, duration=60))
+      logger.info("Worker ended lifecycle for {}".format(self.device.name))
+    except Exception as err:
+      logger.error("On observe exception")
+      logger.error(err, exc_info=True)
+    finally:
+      self.observeThread = None
+
+  def consume(self, payload):
+    self.payloads.append(payload)
+    self.dirty = True
+
+  def transfer(self):
+    lc = self.device.light_control
+    actions = []
+    for payload in self.payloads:
+      if payload[PAYLOAD_STATE] == STATE_ON:
+        keys = {}
+        if PAYLOAD_TRANSITION in payload:
+          keys['transition_time'] = int(payload[PAYLOAD_TRANSITION]) * 10
+
+        if PAYLOAD_COLOR_TEMP in payload:
+          actions.append(lc.set_color_temp(int(payload[PAYLOAD_COLOR_TEMP]), **keys))
+        elif PAYLOAD_BRIGHTNESS in payload: # check of this can be one action!
+          brightness = int(payload[PAYLOAD_BRIGHTNESS])
+          if brightness == 255:
+            brightness = 254
+          actions.append(lc.set_dimmer(brightness, **keys))
+        else:
+          actions.append(lc.set_state(True))
+      else:
+        actions.append(lc.set_state(False))
+
+    if len(actions) > 0:
+      try:
+        logger.info("There is {} actions to execute for {}".format(len(actions), self.device.name))
+        self.api(actions)
+        self.payloads = []
+        self.dirty = True
+      except RequestTimeout as e:
+        logger.info("There was timeout for actions, retry in some time")
+
+  def fetch(self):
+    try:
+      logger.info("Force fetch state for {}".format(self.device.name))
+      def process_result(result):
+        return Device(result)
+      self.device = self.api(Command('get', [ROOT_DEVICES, self.device.id], process_result=process_result))
+      time.sleep(0.1)
+    except RequestTimeout as e:
+      self.dirty = True
+      logger.info("There was timeout for actions, retry in some time")
+
 class LightGateway(MqttController):
   def __init__(self, config):
     MqttController.__init__(self, config)
-    self.lights = []
+    self.lights = {}
     self.actions = []
     self.config = config
+    self.connected = False
     self.configure_api()
     self.timeouts = 0
 
@@ -65,87 +178,42 @@ class LightGateway(MqttController):
     api_factory = APIFactory(host=self.config['host'], psk_id=self.config['identity'], psk=self.config['psk'])
     self.api = api_factory.request
     self.gateway = Gateway()
-    self.devices_commands = self.api(self.gateway.get_devices())
-    self.lights = []
+    self.lights = {}
 
   def refresh_lights(self):
     try:
+      self.devices_commands = self.api(self.gateway.get_devices())
       devices = self.api(self.devices_commands)
-      self.lights = []
+      self.lights = {}
       for dev in devices:
         if dev.has_light_control:
-          logger.info("Found light: {}".format(dev.name))
-          self.lights.append(dev)
-          self.observe(self.api, dev)
-          light_topic = set_light_topic(dev.name)
-          logger.info('Subscribing to {}'.format(light_topic))
-          self.client.unsubscribe(light_topic)
-          self.client.subscribe(light_topic)
+          light_name = slugify(dev.name)
+          if light_name in self.lights:
+            self.lights[light_name].change(dev)
+          else:
+            self.lights[light_name] = MyLight(self.api, dev, self.client)
         else:
-          logger.info("Found device: {}".format(dev.name))
-      self.read_light_states()
+          logger.info("Ignoring device: {}".format(dev.name))
     except RequestTimeout as e:
       logger.info("There was timeout for fetching lights, retry in some time")
       self.next_update = time.time() + 1
       self.timeouts = self.timeouts + 1
 
-  def observe(self, api, device):
-    logger.info("Registering observe for light: {}".format(device.name))
-    def callback(updated_device):
-      logger.info("On observe for light: {}".format(updated_device.name))
-      self.push_light_state(updated_device)
-
-    def err_callback(err):
-      logger.error("On observe callback error")
-      logger.error(err, exc_info=True)
-
-    def worker():
-      try:
-        logger.info("Started Worker observe for light: {}".format(device.name))
-        api(device.observe(callback, err_callback, duration=REFRESH_EVERY))
-        logger.info("Worker ended lifecycle for {}".format(device.name))
-      except Exception as err:
-        logger.error("On observe callback error")
-        logger.error(err, exc_info=True)
-    threading.Thread(target=worker, daemon=True).start()
-
-  def find_light(self, name):
-    for light in self.lights:
-      if light.name == name or slugify(light.name) == name:
-        return light
-
   def on_connect(self, client, userdata, flags, rc):
     logger.info('Connected to broker')
-    self.next_update = time.time() + 5
+    self.connected = True
 
   def on_message(self, client, userdata, msg):
     logger.info('Received message: {} with payload: {}'.format(msg.topic, msg.payload))
     light_name = extract_light_name(msg.topic)
-    light = self.find_light(light_name)
+    light = self.lights[slugify(light_name)]
     payload = json.loads(msg.payload.decode('utf-8'))
 
     if light is None:
-      logger.error("Could not find light with this name!")
+      logger.error("Could not find light with this name: {}".format(light_name))
       return
 
-    lc = light.light_control
-
-    if payload[PAYLOAD_STATE] == STATE_ON:
-      keys = {}
-      if PAYLOAD_TRANSITION in payload:
-        keys['transition_time'] = int(payload[PAYLOAD_TRANSITION]) * 10
-
-      if PAYLOAD_COLOR_TEMP in payload:
-        self.actions.append(lc.set_color_temp(int(payload[PAYLOAD_COLOR_TEMP]), **keys))
-      elif PAYLOAD_BRIGHTNESS in payload: # check of this can be one action!
-        brightness = int(payload[PAYLOAD_BRIGHTNESS])
-        if brightness == 255:
-          brightness = 254
-        self.actions.append(lc.set_dimmer(brightness, **keys))
-      else:
-        self.actions.append(lc.set_state(True))
-    else:
-      self.actions.append(lc.set_state(False))
+    light.consume(payload)
 
   def should_update_lights(self):
     if time.time() - self.next_update >= 0:
@@ -154,49 +222,13 @@ class LightGateway(MqttController):
     else:
       return False
 
-  def read_light_states(self):
-    logger.info("Broadcasting lights")
-    for light in self.lights:
-      self.push_light_state(light)
-
-  def push_light_state(self, light):
-    topic = state_light_topic(light.name)
-    payload = json_light_state(light)
-    logger.info("Publishing to {} with payload {}".format(topic, payload))
-    self.client.publish(topic, payload, 1)
-
-  def restart_gateway(self):
-    logger.info("Restaring gateway")
-    self.timeouts = 0
-    topic = "home/living_room/rf_emitter/set"
-    self.client.topic(topic, json.dumps({ "name": "ikea_gateway", "code": 1364, "pulse_length": 321 }), 1)
-    logger.info("Switched off")
-    time.sleep(10)
-    logger.info("Switched on")
-    self.client.topic(topic, json.dumps({ "name": "ikea_gateway", "code": 1361, "pulse_length": 321 }), 1)
-    time.sleep(30)
-    self.refresh_lights()
-
-  def process_actions(self):
-    if len(self.actions) == 0:
-      return
-    try:
-      logger.info("There is {} actions to execute".format(len(self.actions)))
-      self.api(self.actions)
-      self.actions = []
-      logger.info("Pushed action!")
-      self.read_light_states()
-    except RequestTimeout as e:
-      logger.info("There was timeout for actions, retry in some time")
-      self.timeouts = self.timeouts + 1
-
   def update(self):
     self.client.loop(timeout = 0.5)
-    self.process_actions()
-    if self.should_update_lights():
-      self.refresh_lights()
-      self.read_light_states()
-      self.timeouts = 0
-    time.sleep(0.5)
-    if self.timeouts >= 3:
-      self.restart_gateway()
+    if self.connected:
+      if len(self.lights) == 0:
+        self.refresh_lights()
+      
+      for name in self.lights:
+        self.lights[name].update()
+    time.sleep(0.1)
+
